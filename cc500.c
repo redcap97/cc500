@@ -152,6 +152,16 @@ void save_int(char *p, int n)
   p[3] = n >> 24;
 }
 
+void save_imm24(char *p, int n) {
+  p[0] = n;
+  p[1] = n >> 8;
+  p[2] = n >> 16;
+}
+
+int encode_pc_relative(int ra) {
+  return (ra - 8) >> 2;
+}
+
 int load_int(char *p)
 {
   return ((p[0] & 255) + ((p[1] & 255) << 8) +
@@ -171,17 +181,24 @@ void emit(int n, char *s)
     codepos = codepos + 1;
     i = i + 1;
   }
+
+  /* data must be 4-byte aligned */
+  while (codepos & 3) {
+    code[codepos] = 0;
+    codepos = codepos + 1;
+  }
 }
 
 void be_push()
 {
-  emit(1, "\x50"); /* push %eax */
+  emit(4, "\x04\x00\x2d\xe5"); /* push {r0} */
 }
 
 void be_pop(int n)
 {
-  emit(6, "\x81\xc4...."); /* add $(n * 4),%esp */
-  save_int(code + codepos - 4, n << 2);
+  /* ldr r4, [pc]; b . + 8; the word; add sp, sp, r4 */
+  emit(16, "\x00\x40\x9f\xe5\x00\x00\x00\xea....\x04\xd0\x8d\xe0");
+  save_int(code + codepos - 8, n << 2);
 }
 
 char *table;
@@ -263,21 +280,24 @@ void sym_get_value(char *s)
   int t;
   if ((t = sym_lookup(s)) == 0)
     error();
-  emit(5, "\xb8...."); /* mov $n,%eax */
-  save_int(code + codepos - 4, load_int(table + t + 2));
+  /* ldr r4, [pc]; b . + 8; the word; mov r0, r4 */
+  emit(16, "\x00\x40\x9f\xe5\x00\x00\x00\xea....\x04\x00\xa0\xe1");
+  save_int(code + codepos - 8, load_int(table + t + 2));
   if (table[t + 1] == 'D') { /* defined global */
   }
   else if (table[t + 1] == 'U') /* undefined global */
-    save_int(table + t + 2, codepos + code_offset - 4);
+    save_int(table + t + 2, codepos + code_offset - 8);
   else if (table[t + 1] == 'L') { /* local variable */
     int k = (stack_pos - table[t + 2] - 1) << 2;
-    emit(7, "\x8d\x84\x24...."); /* lea (n * 4)(%esp),%eax */
-    save_int(code + codepos - 4, k);
+    /* ldr r4, [pc]; b . + 8; the word; add r0, sp, r4 */
+    emit(16, "\x00\x40\x9f\xe5\x00\x00\x00\xea....\x04\x00\x8d\xe0");
+    save_int(code + codepos - 8, k);
   }
   else if (table[t + 1] == 'A') { /* argument */
-    int k = (stack_pos + number_of_args - table[t + 2] + 1) << 2;
-    emit(7, "\x8d\x84\x24...."); /* lea (n * 4)(%esp),%eax */
-    save_int(code + codepos - 4, k);
+    int k = (stack_pos + number_of_args - table[t + 2]) << 2;
+    /* ldr r4, [pc]; b . + 8; the word; add r0, sp, r4 */
+    emit(16, "\x00\x40\x9f\xe5\x00\x00\x00\xea....\x04\x00\x8d\xe0");
+    save_int(code + codepos - 8, k);
   }
   else
     error();
@@ -286,44 +306,41 @@ void sym_get_value(char *s)
 void be_start()
 {
   emit(16, "\x7f\x45\x4c\x46\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
-  emit(16, "\x02\x00\x03\x00\x01\x00\x00\x00\x54\x80\x04\x08\x34\x00\x00\x00");
+  emit(16, "\x02\x00\x28\x00\x01\x00\x00\x00\x54\x80\x00\x00\x34\x00\x00\x00");
   emit(16, "\x00\x00\x00\x00\x00\x00\x00\x00\x34\x00\x20\x00\x01\x00\x00\x00");
-  emit(16, "\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x80\x04\x08");
-  emit(16, "\x00\x80\x04\x08\x10\x4b\x00\x00\x10\x4b\x00\x00\x07\x00\x00\x00");
-  emit(16, "\x00\x10\x00\x00\xe8\x00\x00\x00\x00\x89\xc3\x31\xc0\x40\xcd\x80");
+  emit(16, "\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x80\x00\x00");
+  emit(16, "\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00");
+  emit(16, "\x00\x80\x00\x00\x00\x00\x00\xeb\x01\x70\xa0\xe3\x00\x00\x00\xef");
 
   sym_define_global(sym_declare_global("exit"));
-  /* pop %ebx ; pop %ebx ; xor %eax,%eax ; inc %eax ; int $0x80 */
-  emit(7, "\x5b\x5b\x31\xc0\x40\xcd\x80");
+  /* pop {r0}; mov r7, #1; svc 0x00000000; bx lr */
+  emit(16, "\x04\x00\x9d\xe4\x01\x70\xa0\xe3\x00\x00\x00\xef\x1e\xff\x2f\xe1");
 
   sym_define_global(sym_declare_global("getchar"));
-  /* mov $3,%eax ; xor %ebx,%ebx ; push %ebx ; mov %esp,%ecx */
-  emit(10, "\xb8\x03\x00\x00\x00\x31\xdb\x53\x89\xe1");
-  /* xor %edx,%edx ; inc %edx ; int $0x80 */
-  /* test %eax,%eax ; pop %eax ; jne . + 7 */
-  emit(10, "\x31\xd2\x42\xcd\x80\x85\xc0\x58\x75\x05");
-  /* mov $-1,%eax ; ret */
-  emit(6, "\xb8\xff\xff\xff\xff\xc3");
+  /* mov r7, #3; mov r0, #0; push {r0}; mov r1, sp */
+  emit(16, "\x03\x70\xa0\xe3\x00\x00\xa0\xe3\x04\x00\x2d\xe5\x0d\x10\xa0\xe1");
+  /* mov r2, #1; svc 0x00000000; tst r0, r0; pop {r0} */
+  emit(16, "\x01\x20\xa0\xe3\x00\x00\x00\xef\x00\x00\x10\xe1\x04\x00\x9d\xe4");
+  /* bne . + 8; mvn r0, #0; bx lr */
+  emit(12, "\x00\x00\x00\x1a\x00\x00\xe0\xe3\x1e\xff\x2f\xe1");
 
   sym_define_global(sym_declare_global("malloc"));
-  /* mov 4(%esp),%eax */
-  emit(4, "\x8b\x44\x24\x04");
-  /* push %eax ; xor %ebx,%ebx ; mov $45,%eax ; int $0x80 */
-  emit(10, "\x50\x31\xdb\xb8\x2d\x00\x00\x00\xcd\x80");
-  /* pop %ebx ; add %eax,%ebx ; push %eax ; push %ebx ; mov $45,%eax */
-  emit(10, "\x5b\x01\xc3\x50\x53\xb8\x2d\x00\x00\x00");
-  /* int $0x80 ; pop %ebx ; cmp %eax,%ebx ; pop %eax ; je . + 7 */
-  emit(8, "\xcd\x80\x5b\x39\xc3\x58\x74\x05");
-  /* mov $-1,%eax ; ret */
-  emit(6, "\xb8\xff\xff\xff\xff\xc3");
+  /* mov r7, #45; mov r0, #0; svc 0x00000000; mov r1, r0 */
+  emit(16, "\x2d\x70\xa0\xe3\x00\x00\xa0\xe3\x00\x00\x00\xef\x00\x10\xa0\xe1");
+  /* ldr r0, [sp]; add r0, r0, r1; push {r1}; push {r0} */
+  emit(16, "\x00\x00\x9d\xe5\x01\x00\x80\xe0\x04\x10\x2d\xe5\x04\x00\x2d\xe5");
+  /* svc 0x00000000; pop {r1}; cmp r0, r1; pop {r0} */
+  emit(16, "\x00\x00\x00\xef\x04\x10\x9d\xe4\x01\x00\x50\xe1\x04\x00\x9d\xe4");
+  /* beq . + 8; mvn r0, #0; bx lr */
+  emit(12, "\x00\x00\x00\x0a\x00\x00\xe0\xe3\x1e\xff\x2f\xe1");
 
   sym_define_global(sym_declare_global("putchar"));
-  /* mov $4,%eax ; xor %ebx,%ebx ; inc %ebx */
-  emit(8, "\xb8\x04\x00\x00\x00\x31\xdb\x43");
-  /*  lea 4(%esp),%ecx ; mov %ebx,%edx ; int $0x80 ; ret */
-  emit(9, "\x8d\x4c\x24\x04\x89\xda\xcd\x80\xc3");
+  /* mov r7, #4; mov r0, #1; mov r1, sp; mov r2, #1 */
+  emit(16, "\x04\x70\xa0\xe3\x01\x00\xa0\xe3\x0d\x10\xa0\xe1\x01\x20\xa0\xe3");
+  /* svc 0x00000000; bx lr */
+  emit(8,  "\x00\x00\x00\xef\x1e\xff\x2f\xe1");
 
-  save_int(code + 85, codepos - 89); /* entry set to first thing in file */
+  save_imm24(code + 84, encode_pc_relative(codepos - 84)); /* entry set to first thing in file */
 }
 
 void be_finish()
@@ -341,9 +358,9 @@ void promote(int type)
 {
   /* 1 = char lval, 2 = int lval, 3 = other */
   if (type == 1)
-    emit(3, "\x0f\xbe\x00"); /* movsbl (%eax),%eax */
+    emit(4, "\x00\x00\xd0\xe5"); /* ldrb r0, [r0] */
   else if (type == 2)
-    emit(2, "\x8b\x00"); /* mov (%eax),%eax */
+    emit(4, "\x00\x00\x90\xe5"); /* ldr r0, [r0] */
 }
 
 int expression();
@@ -364,8 +381,9 @@ int primary_expr()
       n = (n << 1) + (n << 3) + token[i] - '0';
       i = i + 1;
     }
-    emit(5, "\xb8...."); /* mov $x,%eax */
-    save_int(code + codepos - 4, n);
+    /* ldr r4, [pc]; b . + 8; the word; mov r0, r4 */
+    emit(16, "\x00\x40\x9f\xe5\x00\x00\x00\xea....\x04\x00\xa0\xe1");
+    save_int(code + codepos - 8, n);
     type = 3;
   }
   else if (('a' <= token[0]) & (token[0] <= 'z')) {
@@ -379,14 +397,16 @@ int primary_expr()
   }
   else if ((token[0] == 39) & (token[1] != 0) &
 	   (token[2] == 39) & (token[3] == 0)) {
-    emit(5, "\xb8...."); /* mov $x,%eax */
-    save_int(code + codepos - 4, token[1]);
+    /* ldr r4, [pc]; b . + 8; the word; mov r0, r4 */
+    emit(16, "\x00\x40\x9f\xe5\x00\x00\x00\xea....\x04\x00\xa0\xe1");
+    save_int(code + codepos - 8, token[1]);
     type = 3;
   }
   else if (token[0] == '"') {
     int i = 0;
     int j = 1;
     int k;
+    int p;
     while (token[j] != '"') {
       if ((token[j] == 92) & (token[j + 1] == 'x')) {
 	if (token[j + 2] <= '9')
@@ -408,11 +428,11 @@ int primary_expr()
       i = i + 1;
     }
     token[i] = 0;
-    /* call ... ; the string ; pop %eax */
-    emit(5, "\xe8....");
-    save_int(code + codepos - 4, i + 1);
+    /* mov r0, pc; b . + sizeof(the string); the string */
+    emit(8, "\x0f\x00\xa0\xe1\x00\x00\x00\xea");
+    p = codepos;
     emit(i + 1, token);
-    emit(1, "\x58");
+    save_imm24(code + p - 4, encode_pc_relative(codepos - p + 4));
     type = 3;
   }
   else
@@ -446,13 +466,18 @@ int postfix_expr()
 {
   int type = primary_expr();
   if (accept("[")) {
-    binary1(type); /* pop %ebx ; add %ebx,%eax */
-    binary2(expression(), 3, "\x5b\x01\xd8");
+    binary1(type); /* pop {r1}; add r0, r0, r1 */
+    binary2(expression(), 8, "\x04\x10\x9d\xe4\x01\x00\x80\xe0");
     expect("]");
     type = 1;
   }
   else if (accept("(")) {
-    int s = stack_pos;
+    int s;
+
+    emit(4, "\x04\xe0\x2d\xe5"); /* push {lr} */
+    stack_pos = stack_pos + 1;
+
+    s = stack_pos;
     be_push();
     stack_pos = stack_pos + 1;
     if (accept(")") == 0) {
@@ -466,11 +491,18 @@ int postfix_expr()
       }
       expect(")");
     }
-    emit(7, "\x8b\x84\x24...."); /* mov (n * 4)(%esp),%eax */
-    save_int(code + codepos - 4, (stack_pos - s - 1) << 2);
-    emit(2, "\xff\xd0"); /* call *%eax */
+    /* ldr r4, [pc]; b . + 8; the word; ldr r0, [sp, r4] */
+    emit(16, "\x00\x40\x9f\xe5\x00\x00\x00\xea....\x04\x00\x9d\xe7");
+    /* mov lr, pc; mov pc, r0 */
+    emit(8,  "\x0f\xe0\xa0\xe1\x00\xf0\xa0\xe1");
+    save_int(code + codepos - 16, (stack_pos - s - 1) << 2);
+
     be_pop(stack_pos - s);
     stack_pos = s;
+
+    emit(4, "\x04\xe0\x9d\xe4"); /* pop {lr} */
+    stack_pos = stack_pos - 1;
+
     type = 3;
   }
   return type;
@@ -487,12 +519,12 @@ int additive_expr()
   int type = postfix_expr();
   while (1) {
     if (accept("+")) {
-      binary1(type); /* pop %ebx ; add %ebx,%eax */
-      type = binary2(postfix_expr(), 3, "\x5b\x01\xd8");
+      binary1(type); /* pop {r1}; add r0, r1, r0 */
+      type = binary2(postfix_expr(), 8, "\x04\x10\x9d\xe4\x00\x00\x81\xe0");
     }
     else if (accept("-")) {
-      binary1(type); /* pop %ebx ; sub %eax,%ebx ; mov %ebx,%eax */
-      type = binary2(postfix_expr(), 5, "\x5b\x29\xc3\x89\xd8");
+      binary1(type); /* pop {r1}; sub r0, r1, r0 */
+      type = binary2(postfix_expr(), 8, "\x04\x10\x9d\xe4\x00\x00\x41\xe0");
     }
     else
       return type;
@@ -510,12 +542,12 @@ int shift_expr()
   int type = additive_expr();
   while (1) {
     if (accept("<<")) {
-      binary1(type); /* mov %eax,%ecx ; pop %eax ; shl %cl,%eax */
-      type = binary2(additive_expr(), 5, "\x89\xc1\x58\xd3\xe0");
+      binary1(type); /* pop {r1}; lsl r0, r1, r0 */
+      type = binary2(additive_expr(), 8, "\x04\x10\x9d\xe4\x11\x00\xa0\xe1");
     }
     else if (accept(">>")) {
-      binary1(type); /* mov %eax,%ecx ; pop %eax ; sar %cl,%eax */
-      type = binary2(additive_expr(), 5, "\x89\xc1\x58\xd3\xf8");
+      binary1(type); /* pop {r1}; asr r0, r1, r0 */
+      type = binary2(additive_expr(), 8, "\x04\x10\x9d\xe4\x51\x00\xa0\xe1");
     }
     else
       return type;
@@ -532,9 +564,9 @@ int relational_expr()
   int type = shift_expr();
   while (accept("<=")) {
     binary1(type);
-    /* pop %ebx ; cmp %eax,%ebx ; setle %al ; movzbl %al,%eax */
+    /* pop {r1}; cmp r1, r0; movle r0, #1; movgt r0, #0 */
     type = binary2(shift_expr(),
-		   9, "\x5b\x39\xc3\x0f\x9e\xc0\x0f\xb6\xc0");
+		   16, "\x04\x10\x9d\xe4\x00\x00\x51\xe1\x01\x00\xa0\xd3\x00\x00\xa0\xc3");
   }
   return type;
 }
@@ -551,15 +583,15 @@ int equality_expr()
   while (1) {
     if (accept("==")) {
       binary1(type);
-      /* pop %ebx ; cmp %eax,%ebx ; sete %al ; movzbl %al,%eax */
+      /* pop {r1}; cmp r1, r0; moveq r0, #1; movne r0, #0 */
       type = binary2(relational_expr(),
-		     9, "\x5b\x39\xc3\x0f\x94\xc0\x0f\xb6\xc0");
+		     16, "\x04\x10\x9d\xe4\x00\x00\x51\xe1\x01\x00\xa0\x03\x00\x00\xa0\x13");
     }
     else if (accept("!=")) {
       binary1(type);
-      /* pop %ebx ; cmp %eax,%ebx ; setne %al ; movzbl %al,%eax */
+      /* pop {r1}; cmp r1, r0; moveq r0, #0; movne r0, #1 */
       type = binary2(relational_expr(),
-		     9, "\x5b\x39\xc3\x0f\x95\xc0\x0f\xb6\xc0");
+		     16, "\x04\x10\x9d\xe4\x00\x00\x51\xe1\x00\x00\xa0\x03\x01\x00\xa0\x13");
     }
     else
       return type;
@@ -575,8 +607,8 @@ int bitwise_and_expr()
 {
   int type = equality_expr();
   while (accept("&")) {
-    binary1(type); /* pop %ebx ; and %ebx,%eax */
-    type = binary2(equality_expr(), 3, "\x5b\x21\xd8");
+    binary1(type); /* pop {r1}; and r0, r1, r0 */
+    type = binary2(equality_expr(), 8, "\x04\x10\x9d\xe4\x00\x00\x01\xe0");
   }
   return type;
 }
@@ -590,8 +622,8 @@ int bitwise_or_expr()
 {
   int type = bitwise_and_expr();
   while (accept("|")) {
-    binary1(type); /* pop %ebx ; or %ebx,%eax */
-    type = binary2(bitwise_and_expr(), 3, "\x5b\x09\xd8");
+    binary1(type); /* pop {r1}; orr r0, r1, r0 */
+    type = binary2(bitwise_and_expr(), 8, "\x04\x10\x9d\xe4\x00\x00\x81\xe1");
   }
   return type;
 }
@@ -609,9 +641,9 @@ int expression()
     stack_pos = stack_pos + 1;
     promote(expression());
     if (type == 2)
-      emit(3, "\x5b\x89\x03"); /* pop %ebx ; mov %eax,(%ebx) */
+      emit(8, "\x04\x10\x9d\xe4\x00\x00\x81\xe5"); /* pop {r1}; str r0, [r1] */
     else
-      emit(3, "\x5b\x88\x03"); /* pop %ebx ; mov %al,(%ebx) */
+      emit(8, "\x04\x10\x9d\xe4\x00\x00\xc1\xe5"); /* pop {r1}; strb r0, [r1] */
     stack_pos = stack_pos - 1;
     type = 3;
   }
@@ -667,35 +699,35 @@ void statement()
   else if (accept("if")) {
     expect("(");
     promote(expression());
-    emit(8, "\x85\xc0\x0f\x84...."); /* test %eax,%eax ; je ... */
+    emit(8, "\x00\x00\x10\xe1...\x0a"); /* tst r0, r0; beq ... */
     p1 = codepos;
     expect(")");
     statement();
-    emit(5, "\xe9...."); /* jmp ... */
+    emit(4, "...\xea"); /* b ... */
     p2 = codepos;
-    save_int(code + p1 - 4, codepos - p1);
+    save_imm24(code + p1 - 4, encode_pc_relative(codepos - p1 + 4));
     if (accept("else"))
       statement();
-    save_int(code + p2 - 4, codepos - p2);
+    save_imm24(code + p2 - 4, encode_pc_relative(codepos - p2 + 4));
   }
   else if (accept("while")) {
     expect("(");
     p1 = codepos;
     promote(expression());
-    emit(8, "\x85\xc0\x0f\x84...."); /* test %eax,%eax ; je ... */
+    emit(8, "\x00\x00\x10\xe1...\x0a"); /* tst r0, r0; beq ... */
     p2 = codepos;
     expect(")");
     statement();
-    emit(5, "\xe9...."); /* jmp ... */
-    save_int(code + codepos - 4, p1 - codepos);
-    save_int(code + p2 - 4, codepos - p2);
+    emit(4, "...\xea"); /* b ... */
+    save_imm24(code + codepos - 4, encode_pc_relative(p1 - codepos + 4));
+    save_imm24(code + p2 - 4, encode_pc_relative(codepos - p2 + 4));
   }
   else if (accept("return")) {
     if (peek(";") == 0)
       promote(expression());
     expect(";");
     be_pop(stack_pos);
-    emit(1, "\xc3"); /* ret */
+    emit(4, "\x1e\xff\x2f\xe1"); /* bx lr */
   }
   else {
     expression();
@@ -746,7 +778,7 @@ void program()
       if (accept(";") == 0) {
 	sym_define_global(current_symbol);
 	statement();
-	emit(1, "\xc3"); /* ret */
+	emit(4, "\x1e\xff\x2f\xe1"); /* bx lr */
       }
       table_pos = n;
     }
@@ -757,7 +789,7 @@ void program()
 
 int main1()
 {
-  code_offset = 134512640; /* 0x08048000 */
+  code_offset = 32768; /* 0x8000 */
   be_start();
   nextc = getchar();
   get_token();
